@@ -21,6 +21,18 @@ class AppStore extends ChangeNotifier {
   final Map<String, DayRecord> records = {};
   StepSource stepSource = StepSource.healthConnect;
 
+  /// 未保存の下書き（日付 → 項目）。保存ボタンを押すまで記録には反映しない
+  final Map<String, Map<String, String>> drafts = {};
+
+  void setDraft(String date, Map<String, String>? d) {
+    if (d == null) {
+      if (drafts.remove(date) == null) return;
+    } else {
+      drafts[date] = d;
+    }
+    scheduleSave();
+  }
+
   /// 端末センサー計測用の状態
   Map<String, dynamic> sensorState = {};
 
@@ -84,6 +96,7 @@ class AppStore extends ChangeNotifier {
         'profile': profile.toJson(),
         'settings': {'stepSource': stepSource.name},
         'sensorState': sensorState,
+        'drafts': drafts,
         'records': records.values.map((r) => r.toJson()).toList()
           ..sort((a, b) => (a['date'] as String).compareTo(b['date'] as String)),
       };
@@ -96,6 +109,13 @@ class AppStore extends ChangeNotifier {
       }
       final s = j['settings'];
       if (s is Map) stepSource = stepSourceFrom(s['stepSource'] as String?);
+      drafts.clear();
+      final dr = j['drafts'];
+      if (dr is Map) {
+        dr.forEach((k, v) {
+          if (v is Map) drafts['$k'] = v.map((a, b) => MapEntry('$a', '$b'));
+        });
+      }
       if (j['sensorState'] is Map) {
         sensorState = Map<String, dynamic>.from(j['sensorState']);
       }

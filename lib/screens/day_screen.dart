@@ -22,10 +22,7 @@ class DayScreen extends StatelessWidget {
       listenable: Listenable.merge([selectedDay, AppStore.instance.externalRev]),
       builder: (context, _) {
         final day = selectedDay.value;
-        return _DayPage(
-          key: ValueKey('${dateKey(day)}#${AppStore.instance.externalRev.value}'),
-          day: day,
-        );
+        return _DayPage(key: ValueKey('${dateKey(day)}#${AppStore.instance.externalRev.value}'), day: day);
       },
     );
   }
@@ -49,6 +46,10 @@ class _DayPageState extends State<_DayPage> {
   final _condFocus = FocusNode();
   bool _showPreview = true;
 
+  /// 編集モード（保存済みの日は閲覧モードで開き、誤入力・上書きを防ぐ）
+  bool _editing = false;
+  bool _loading = false;
+
   // 歩数
   bool _stepsLoading = false;
   StepsResult? _stepsError;
@@ -65,14 +66,20 @@ class _DayPageState extends State<_DayPage> {
     _title = TextEditingController(text: r?.title ?? '');
     _menu = TextEditingController(text: r?.menu ?? '');
     _cond = TextEditingController(text: r?.condition ?? '');
-    _weight = TextEditingController(
-        text: r?.weightKg != null ? fmtNum(r!.weightKg!) : '');
-    _title.addListener(() => _save((r) => r.title = _title.text));
-    _menu.addListener(() {
-      _save((r) => r.menu = _menu.text);
-      setState(() {});
-    });
-    _cond.addListener(() => _save((r) => r.condition = _cond.text));
+    _weight = TextEditingController(text: r?.weightKg != null ? fmtNum(r!.weightKg!) : '');
+    final draft = store.drafts[dateKey(day)];
+    if (draft != null) {
+      _loading = true;
+      _title.text = draft['title'] ?? _title.text;
+      _menu.text = draft['menu'] ?? _menu.text;
+      _cond.text = draft['condition'] ?? _cond.text;
+      _weight.text = draft['weight'] ?? _weight.text;
+      _loading = false;
+    }
+    _editing = draft != null || !_hasSavedContent;
+    for (final c in [_title, _menu, _cond, _weight]) {
+      c.addListener(_onEdited);
+    }
     _menuFocus.addListener(() => setState(() {}));
     _condFocus.addListener(() => setState(() {}));
     WidgetsBinding.instance.addPostFrameCallback((_) => _refreshSteps(auto: true));
@@ -91,18 +98,88 @@ class _DayPageState extends State<_DayPage> {
     super.dispose();
   }
 
-  void _save(void Function(DayRecord) apply) {
-    final r = store.recordFor(day);
-    // 何も入力していない日は空レコードを作らない
-    if (r == null &&
-        _title.text.isEmpty &&
-        _menu.text.isEmpty &&
-        _cond.text.isEmpty) {
+  bool get _hasSavedContent {
+    final r = record;
+    return r != null &&
+        (r.title.trim().isNotEmpty || r.menu.trim().isNotEmpty || r.condition.trim().isNotEmpty);
+  }
+
+  String get _savedWeightText => record?.weightKg != null ? fmtNum(record!.weightKg!) : '';
+
+  /// 保存済みの内容から変更があるか
+  bool get _dirty {
+    final r = record;
+    return _title.text != (r?.title ?? '') ||
+        _menu.text != (r?.menu ?? '') ||
+        _cond.text != (r?.condition ?? '') ||
+        _weight.text.trim() != _savedWeightText;
+  }
+
+  /// 入力のたびに下書きとして控えておく（保存前にアプリを閉じても消えない）
+  void _onEdited() {
+    if (_loading) return;
+    store.setDraft(
+      dateKey(day),
+      _dirty
+          ? {'title': _title.text, 'menu': _menu.text, 'condition': _cond.text, 'weight': _weight.text}
+          : null,
+    );
+    setState(() {});
+  }
+
+  void _startEditing() {
+    setState(() => _editing = true);
+  }
+
+  void _save() {
+    FocusManager.instance.primaryFocus?.unfocus();
+    final w = _weight.text.trim();
+    final kg = w.isEmpty ? null : double.tryParse(w);
+    if (w.isNotEmpty && (kg == null || kg < 20 || kg > 300)) {
+      showToast(context, '体重は20〜300の数値で入力してください');
       return;
     }
-    final rec = r ?? store.ensureRecord(day);
-    apply(rec);
-    store.touch(rec, notify: false);
+    final empty = _title.text.trim().isEmpty && _menu.text.trim().isEmpty && _cond.text.trim().isEmpty;
+    if (record != null || !empty || kg != null) {
+      final rec = store.ensureRecord(day);
+      rec.title = _title.text.trim();
+      rec.menu = _menu.text.trimRight();
+      rec.condition = _cond.text.trimRight();
+      if (kg != rec.weightKg) store.setWeight(day, kg);
+      store.touch(rec);
+    }
+    _loading = true;
+    _title.text = record?.title ?? '';
+    _menu.text = record?.menu ?? '';
+    _cond.text = record?.condition ?? '';
+    _weight.text = _savedWeightText;
+    _loading = false;
+    store.setDraft(dateKey(day), null);
+    store.saveNow();
+    setState(() => _editing = !_hasSavedContent);
+    showToast(context, '保存しました');
+  }
+
+  Future<void> _cancelEditing() async {
+    FocusManager.instance.primaryFocus?.unfocus();
+    if (_dirty) {
+      final ok = await confirmDialog(
+        context,
+        title: '変更を破棄しますか？',
+        message: '保存していない入力内容は元に戻せません。',
+        ok: '破棄する',
+        danger: true,
+      );
+      if (!ok || !mounted) return;
+    }
+    _loading = true;
+    _title.text = record?.title ?? '';
+    _menu.text = record?.menu ?? '';
+    _cond.text = record?.condition ?? '';
+    _weight.text = _savedWeightText;
+    _loading = false;
+    store.setDraft(dateKey(day), null);
+    setState(() => _editing = !_hasSavedContent);
   }
 
   // ---------------- 歩数 ----------------
@@ -115,8 +192,12 @@ class _DayPageState extends State<_DayPage> {
       final ok = await StepsService.instance.startSensor();
       if (!mounted) return;
       if (!ok) {
-        setState(() => _stepsError = const StepsResult(
-            error: '「身体活動」の権限が許可されていないため、歩数を計測できません。', needsPermission: true));
+        setState(
+          () => _stepsError = const StepsResult(
+            error: '「身体活動」の権限が許可されていないため、歩数を計測できません。',
+            needsPermission: true,
+          ),
+        );
         return;
       }
       _sensorSub ??= StepsService.instance.sensorTodaySteps.listen((_) {
@@ -274,6 +355,7 @@ class _DayPageState extends State<_DayPage> {
 
   Future<void> _copyFromPast() async {
     FocusManager.instance.primaryFocus?.unfocus();
+    if (!_editing) _startEditing();
     final picked = await showModalBottomSheet<DayRecord>(
       context: context,
       isScrollControlled: true,
@@ -284,13 +366,16 @@ class _DayPageState extends State<_DayPage> {
 
     var menu = picked.menu.trim();
     // 見出し行の日付を今日の日付に置き換える
-    menu = menu.split('\n').map((l) {
-      final m = headerRe.firstMatch(normalizeText(l));
-      if (m != null && m.group(2) != null) {
-        return '【${m.group(1)}】${dateKey(day).replaceAll('-', '/')}';
-      }
-      return l;
-    }).join('\n');
+    menu = menu
+        .split('\n')
+        .map((l) {
+          final m = headerRe.firstMatch(normalizeText(l));
+          if (m != null && m.group(2) != null) {
+            return '【${m.group(1)}】${dateKey(day).replaceAll('-', '/')}';
+          }
+          return l;
+        })
+        .join('\n');
 
     var replace = true;
     if (_menu.text.trim().isNotEmpty) {
@@ -319,7 +404,7 @@ class _DayPageState extends State<_DayPage> {
     }
     showToast(
       context,
-      '${fmtDateShort(picked.dateTime)}のメニューをコピーしました',
+      '${fmtDateShort(picked.dateTime)}のメニューをコピーしました（保存ボタンで確定）',
       action: SnackBarAction(
         label: '元に戻す',
         onPressed: () {
@@ -333,6 +418,16 @@ class _DayPageState extends State<_DayPage> {
   // ---------------- 共有 ----------------
 
   Future<void> _copyReport() async {
+    if (_dirty) {
+      final ok = await confirmDialog(
+        context,
+        title: '保存していない変更があります',
+        message: '日報には保存済みの内容が使われます。先に保存してからコピーしますか？',
+        ok: '保存してコピー',
+      );
+      if (!ok || !mounted) return;
+      _save();
+    }
     await store.saveNow();
     final text = buildShareText(day);
     await Clipboard.setData(ClipboardData(text: text));
@@ -388,29 +483,32 @@ class _DayPageState extends State<_DayPage> {
           onTap: _pickDate,
           child: Padding(
             padding: const EdgeInsets.symmetric(vertical: 8),
-            child: Row(mainAxisSize: MainAxisSize.min, children: [
-              Flexible(
-                child: FittedBox(
-                  fit: BoxFit.scaleDown,
-                  child: Text(fmtDateJa(day), style: theme.textTheme.titleMedium),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Flexible(
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    child: Text(fmtDateJa(day), style: theme.textTheme.titleMedium),
+                  ),
                 ),
-              ),
-              if (isToday)
-                Container(
-                  margin: const EdgeInsets.only(left: 6),
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-                  decoration: BoxDecoration(
-                      color: theme.colorScheme.primary, borderRadius: BorderRadius.circular(6)),
-                  child: Text('今日',
-                      style: TextStyle(color: theme.colorScheme.onPrimary, fontSize: 12)),
-                ),
-              const Icon(Icons.arrow_drop_down),
-            ]),
+                if (isToday)
+                  Container(
+                    margin: const EdgeInsets.only(left: 6),
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: theme.colorScheme.primary,
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Text('今日', style: TextStyle(color: theme.colorScheme.onPrimary, fontSize: 12)),
+                  ),
+                const Icon(Icons.arrow_drop_down),
+              ],
+            ),
           ),
         ),
         actions: [
-          if (!isToday)
-            TextButton(onPressed: () => selectedDay.value = today(), child: const Text('今日へ')),
+          if (!isToday) TextButton(onPressed: () => selectedDay.value = today(), child: const Text('今日へ')),
           IconButton(
             tooltip: '次の日',
             icon: const Icon(Icons.chevron_right),
@@ -420,7 +518,17 @@ class _DayPageState extends State<_DayPage> {
       ),
       floatingActionButton: keyboardOpen
           ? null
+          : _editing
+          ? (_dirty
+                ? FloatingActionButton.extended(
+                    heroTag: 'save',
+                    onPressed: _save,
+                    icon: const Icon(Icons.check),
+                    label: const Text('保存する'),
+                  )
+                : null)
           : FloatingActionButton.extended(
+              heroTag: 'report',
               onPressed: _copyReport,
               icon: const Icon(Icons.content_copy),
               label: const Text('日報をコピー'),
@@ -433,16 +541,13 @@ class _DayPageState extends State<_DayPage> {
               onRepeat: _repeatLastSet,
               onPrevious: _insertPrevious,
               onDone: () => FocusManager.instance.primaryFocus?.unfocus(),
+              onSave: _dirty ? _save : null,
             )
           : null,
       body: ListView(
         padding: const EdgeInsets.only(top: 4, bottom: 96),
         keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.manual,
-        children: [
-          _bodyCard(theme),
-          _trainingCard(theme),
-          _conditionCard(theme),
-        ],
+        children: [_editBar(theme), _bodyCard(theme), _trainingCard(theme), _conditionCard(theme)],
       ),
     );
   }
@@ -459,80 +564,97 @@ class _DayPageState extends State<_DayPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              // 体重
-              Expanded(
-                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text('体重', style: theme.textTheme.labelMedium),
-                  const SizedBox(height: 4),
-                  TextField(
-                    controller: _weight,
-                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                    inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9.]'))],
-                    decoration: InputDecoration(
-                      hintText: fmtNum(weight),
-                      suffixText: 'kg',
-                    ),
-                    style: theme.textTheme.titleLarge,
-                    onChanged: (v) {
-                      store.setWeight(day, double.tryParse(v));
-                      setState(() {});
-                    },
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    '身長 ${fmtNum(p.heightCm)}cm／BMI ${(weight / ((p.heightCm / 100) * (p.heightCm / 100))).toStringAsFixed(1)}',
-                    style: theme.textTheme.bodySmall,
-                  ),
-                ]),
-              ),
-              const SizedBox(width: 12),
-              // 歩数
-              Expanded(
-                child: InkWell(
-                  onTap: _editStepsManually,
-                  borderRadius: BorderRadius.circular(8),
-                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Row(children: [
-                      Text('歩数', style: theme.textTheme.labelMedium),
-                      const Spacer(),
-                      if (store.stepSource != StepSource.manual)
-                        SizedBox(
-                          height: 24,
-                          width: 24,
-                          child: _stepsLoading
-                              ? const Padding(
-                                  padding: EdgeInsets.all(4),
-                                  child: CircularProgressIndicator(strokeWidth: 2))
-                              : IconButton(
-                                  padding: EdgeInsets.zero,
-                                  iconSize: 18,
-                                  tooltip: '歩数を更新',
-                                  onPressed: () => _refreshSteps(),
-                                  icon: const Icon(Icons.refresh),
-                                ),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // 体重
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('体重', style: theme.textTheme.labelMedium),
+                      const SizedBox(height: 4),
+                      if (_editing)
+                        TextField(
+                          controller: _weight,
+                          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                          inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9.]'))],
+                          decoration: InputDecoration(hintText: fmtNum(weight), suffixText: 'kg'),
+                          style: theme.textTheme.titleLarge,
+                        )
+                      else
+                        InkWell(
+                          onTap: _tapLocked,
+                          child: Text(
+                            '${fmtNum(weight)}kg',
+                            style: theme.textTheme.headlineSmall?.copyWith(
+                              fontWeight: FontWeight.bold,
+                              color: r?.weightKg == null ? theme.colorScheme.outline : null,
+                            ),
+                          ),
                         ),
-                    ]),
-                    const SizedBox(height: 4),
-                    Text(
-                      steps == null ? '－' : '${fmtKg(steps.toDouble())}歩',
-                      style: theme.textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold),
-                    ),
-                    if (kcal != null)
+                      const SizedBox(height: 4),
                       Text(
-                        '約${walkingKm(steps!, p.heightCm).toStringAsFixed(1)}km／約${kcal.round()}kcal',
+                        '身長 ${fmtNum(p.heightCm)}cm／BMI ${(weight / ((p.heightCm / 100) * (p.heightCm / 100))).toStringAsFixed(1)}',
                         style: theme.textTheme.bodySmall,
                       ),
-                    Text(
-                      r?.stepsSource != null
-                          ? '取得元：${stepSourceFrom(r!.stepsSource).shortLabel}（タップで手入力）'
-                          : 'タップで手入力',
-                      style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.outline),
-                    ),
-                  ]),
+                    ],
+                  ),
                 ),
-              ),
-            ]),
+                const SizedBox(width: 12),
+                // 歩数
+                Expanded(
+                  child: InkWell(
+                    onTap: _editStepsManually,
+                    borderRadius: BorderRadius.circular(8),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Text('歩数', style: theme.textTheme.labelMedium),
+                            const Spacer(),
+                            if (store.stepSource != StepSource.manual)
+                              SizedBox(
+                                height: 24,
+                                width: 24,
+                                child: _stepsLoading
+                                    ? const Padding(
+                                        padding: EdgeInsets.all(4),
+                                        child: CircularProgressIndicator(strokeWidth: 2),
+                                      )
+                                    : IconButton(
+                                        padding: EdgeInsets.zero,
+                                        iconSize: 18,
+                                        tooltip: '歩数を更新',
+                                        onPressed: () => _refreshSteps(),
+                                        icon: const Icon(Icons.refresh),
+                                      ),
+                              ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          steps == null ? '－' : '${fmtKg(steps.toDouble())}歩',
+                          style: theme.textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold),
+                        ),
+                        if (kcal != null)
+                          Text(
+                            '約${walkingKm(steps!, p.heightCm).toStringAsFixed(1)}km／約${kcal.round()}kcal',
+                            style: theme.textTheme.bodySmall,
+                          ),
+                        Text(
+                          r?.stepsSource != null
+                              ? '取得元：${stepSourceFrom(r!.stepsSource).shortLabel}（タップで手入力）'
+                              : 'タップで手入力',
+                          style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.outline),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
             if (_stepsError != null)
               Container(
                 margin: const EdgeInsets.only(top: 8),
@@ -541,16 +663,20 @@ class _DayPageState extends State<_DayPage> {
                   color: theme.colorScheme.errorContainer,
                   borderRadius: BorderRadius.circular(8),
                 ),
-                child: Row(children: [
-                  Expanded(
-                    child: Text(_stepsError!.error!,
-                        style: TextStyle(color: theme.colorScheme.onErrorContainer, fontSize: 13)),
-                  ),
-                  TextButton(
-                    onPressed: _fixStepsProblem,
-                    child: Text(_stepsError!.needsInstall ? 'インストール' : '許可する'),
-                  ),
-                ]),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        _stepsError!.error!,
+                        style: TextStyle(color: theme.colorScheme.onErrorContainer, fontSize: 13),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: _fixStepsProblem,
+                      child: Text(_stepsError!.needsInstall ? 'インストール' : '許可する'),
+                    ),
+                  ],
+                ),
               ),
           ],
         ),
@@ -566,70 +692,166 @@ class _DayPageState extends State<_DayPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Row(children: [
-              const Icon(Icons.fitness_center, size: 20),
-              const SizedBox(width: 6),
-              Expanded(
-                child: FittedBox(
-                  fit: BoxFit.scaleDown,
-                  alignment: Alignment.centerLeft,
-                  child: Text('トレーニングメニュー', style: theme.textTheme.titleMedium),
+            Row(
+              children: [
+                const Icon(Icons.fitness_center, size: 20),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerLeft,
+                    child: Text('トレーニングメニュー', style: theme.textTheme.titleMedium),
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'メニューをコピー（整形済み）',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: _copyMenuOnly,
+                  icon: const Icon(Icons.content_copy, size: 20),
+                ),
+                TextButton.icon(
+                  onPressed: _copyFromPast,
+                  icon: const Icon(Icons.history, size: 18),
+                  label: const Text('過去からコピー'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            if (!_editing)
+              _lockedTraining(theme, parsed)
+            else ...[
+              TextField(
+                controller: _title,
+                textInputAction: TextInputAction.next,
+                onSubmitted: (_) => _menuFocus.requestFocus(),
+                decoration: const InputDecoration(
+                  labelText: 'メニュー名',
+                  hintText: '例：試合前A',
+                  prefixIcon: Icon(Icons.label_outline),
                 ),
               ),
-              IconButton(
-                tooltip: 'メニューをコピー（整形済み）',
-                visualDensity: VisualDensity.compact,
-                onPressed: _copyMenuOnly,
-                icon: const Icon(Icons.content_copy, size: 20),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _menu,
+                focusNode: _menuFocus,
+                minLines: 5,
+                maxLines: null,
+                keyboardType: TextInputType.multiline,
+                style: const TextStyle(fontSize: 17, height: 1.4, fontFamily: 'monospace'),
+                decoration: const InputDecoration(
+                  hintText: 'RPD 90@4 90@4\nPSQ 175@2 175@2\nBSQ 130@2x3\nDBBP 34@4 34@4✕',
+                  helperText: '「種目 重量@回数」で入力／✕＝失敗、x3＝3セット、#＝メモ行',
+                  helperMaxLines: 2,
+                  alignLabelWithHint: true,
+                ),
               ),
-              TextButton.icon(
-                onPressed: _copyFromPast,
-                icon: const Icon(Icons.history, size: 18),
-                label: const Text('過去からコピー'),
+              const SizedBox(height: 8),
+            ],
+            if (_editing)
+              Row(
+                children: [
+                  Text('整形表示', style: theme.textTheme.titleSmall),
+                  const SizedBox(width: 6),
+                  if (parsed.exercises.isNotEmpty) Text('（種目名をタップで履歴）', style: theme.textTheme.bodySmall),
+                  const Spacer(),
+                  IconButton(
+                    tooltip: _showPreview ? '整形表示を閉じる' : '整形表示を開く',
+                    onPressed: () => setState(() => _showPreview = !_showPreview),
+                    icon: Icon(_showPreview ? Icons.expand_less : Icons.expand_more),
+                  ),
+                ],
               ),
-            ]),
-            const SizedBox(height: 8),
-            TextField(
-              controller: _title,
-              textInputAction: TextInputAction.next,
-              onSubmitted: (_) => _menuFocus.requestFocus(),
-              decoration: const InputDecoration(
-                labelText: 'メニュー名',
-                hintText: '例：試合前A',
-                prefixIcon: Icon(Icons.label_outline),
-              ),
-            ),
-            const SizedBox(height: 8),
-            TextField(
-              controller: _menu,
-              focusNode: _menuFocus,
-              minLines: 5,
-              maxLines: null,
-              keyboardType: TextInputType.multiline,
-              style: const TextStyle(fontSize: 17, height: 1.4, fontFamily: 'monospace'),
-              decoration: const InputDecoration(
-                hintText: 'RPD 90@4 90@4\nPSQ 175@2 175@2\nBSQ 130@2x3\nDBBP 34@4 34@4✕',
-                helperText: '「種目 重量@回数」で入力／✕＝失敗、x3＝3セット、#＝メモ行',
-                helperMaxLines: 2,
-                alignLabelWithHint: true,
-              ),
-            ),
-            const SizedBox(height: 8),
-            Row(children: [
-              Text('整形表示', style: theme.textTheme.titleSmall),
-              const SizedBox(width: 6),
-              if (parsed.exercises.isNotEmpty)
-                Text('（種目名をタップで履歴）', style: theme.textTheme.bodySmall),
-              const Spacer(),
-              IconButton(
-                tooltip: _showPreview ? '整形表示を閉じる' : '整形表示を開く',
-                onPressed: () => setState(() => _showPreview = !_showPreview),
-                icon: Icon(_showPreview ? Icons.expand_less : Icons.expand_more),
-              ),
-            ]),
-            if (_showPreview) WorkoutPreview(workout: parsed, day: day),
+            if (_editing && _showPreview) WorkoutPreview(workout: parsed, day: day),
           ],
         ),
+      ),
+    );
+  }
+
+  void _tapLocked() {
+    showToast(
+      context,
+      '「編集する」を押すと変更できます',
+      action: SnackBarAction(label: '編集する', onPressed: _startEditing),
+    );
+  }
+
+  /// 閲覧モードのトレーニング欄（整形表示のみ）
+  Widget _lockedTraining(ThemeData theme, ParsedWorkout parsed) {
+    final title = _title.text.trim();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (title.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 4),
+            child: Text(
+              '【$title】',
+              style: theme.textTheme.titleMedium?.copyWith(
+                color: theme.colorScheme.primary,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+        if (_menu.text.trim().isEmpty)
+          Text('（記録なし）', style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.outline))
+        else
+          WorkoutPreview(workout: parsed, day: day),
+      ],
+    );
+  }
+
+  /// 画面上部の編集状態バー
+  Widget _editBar(ThemeData theme) {
+    final cs = theme.colorScheme;
+    if (!_editing) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(12, 4, 12, 2),
+        child: Row(
+          children: [
+            Icon(Icons.lock_outline, size: 18, color: cs.outline),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text('保存済み（閲覧中）', style: theme.textTheme.bodyMedium?.copyWith(color: cs.outline)),
+            ),
+            FilledButton.tonalIcon(
+              onPressed: _startEditing,
+              icon: const Icon(Icons.edit, size: 18),
+              label: const Text('編集する'),
+            ),
+          ],
+        ),
+      );
+    }
+    final dirty = _dirty;
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 4, 12, 2),
+      padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
+      decoration: BoxDecoration(
+        color: dirty ? cs.tertiaryContainer : cs.surfaceContainerHigh,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            dirty ? Icons.edit_note : Icons.edit,
+            size: 20,
+            color: dirty ? cs.onTertiaryContainer : cs.onSurfaceVariant,
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              dirty ? '未保存の変更があります' : '編集中',
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: dirty ? cs.onTertiaryContainer : cs.onSurfaceVariant,
+                fontWeight: dirty ? FontWeight.bold : null,
+              ),
+            ),
+          ),
+          if (dirty || _hasSavedContent)
+            TextButton(onPressed: _cancelEditing, child: Text(dirty ? '破棄' : '閉じる')),
+          if (dirty) FilledButton(onPressed: _save, child: const Text('保存')),
+        ],
       ),
     );
   }
@@ -642,31 +864,50 @@ class _DayPageState extends State<_DayPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Row(children: [
-              const Icon(Icons.favorite_outline, size: 20),
-              const SizedBox(width: 6),
-              Text('コンディション・栄養メモ', style: theme.textTheme.titleMedium),
-            ]),
-            const SizedBox(height: 8),
-            Wrap(spacing: 6, runSpacing: 0, children: [
-              for (final t in templates)
-                ActionChip(
-                  label: Text(t.replaceAll('：', '')),
-                  visualDensity: VisualDensity.compact,
-                  onPressed: () => _insertCond(t),
-                ),
-            ]),
-            const SizedBox(height: 8),
-            TextField(
-              controller: _cond,
-              focusNode: _condFocus,
-              minLines: 3,
-              maxLines: null,
-              keyboardType: TextInputType.multiline,
-              decoration: const InputDecoration(
-                hintText: '疲労度、睡眠、サプリメントの摂取状況などを自由に記入',
-              ),
+            Row(
+              children: [
+                const Icon(Icons.favorite_outline, size: 20),
+                const SizedBox(width: 6),
+                Text('コンディション・栄養メモ', style: theme.textTheme.titleMedium),
+              ],
             ),
+            const SizedBox(height: 8),
+            if (!_editing)
+              InkWell(
+                onTap: _tapLocked,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: Text(
+                    _cond.text.trim().isEmpty ? '（記入なし）' : _cond.text.trim(),
+                    style: _cond.text.trim().isEmpty
+                        ? theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.outline)
+                        : theme.textTheme.bodyLarge,
+                  ),
+                ),
+              )
+            else ...[
+              Wrap(
+                spacing: 6,
+                runSpacing: 0,
+                children: [
+                  for (final t in templates)
+                    ActionChip(
+                      label: Text(t.replaceAll('：', '')),
+                      visualDensity: VisualDensity.compact,
+                      onPressed: () => _insertCond(t),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _cond,
+                focusNode: _condFocus,
+                minLines: 3,
+                maxLines: null,
+                keyboardType: TextInputType.multiline,
+                decoration: const InputDecoration(hintText: '疲労度、睡眠、サプリメントの摂取状況などを自由に記入'),
+              ),
+            ],
           ],
         ),
       ),
@@ -682,6 +923,7 @@ class _QuickBar extends StatelessWidget {
   final VoidCallback onRepeat;
   final VoidCallback onPrevious;
   final VoidCallback onDone;
+  final VoidCallback? onSave;
 
   const _QuickBar({
     required this.exercises,
@@ -690,78 +932,86 @@ class _QuickBar extends StatelessWidget {
     required this.onRepeat,
     required this.onPrevious,
     required this.onDone,
+    this.onSave,
   });
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     Widget key(String label, VoidCallback onTap, {bool primary = false}) => Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 2),
-          child: Material(
-            color: primary ? cs.primaryContainer : cs.surfaceContainerHighest,
-            borderRadius: BorderRadius.circular(8),
-            child: InkWell(
-              borderRadius: BorderRadius.circular(8),
-              onTap: onTap,
-              child: Container(
-                constraints: const BoxConstraints(minWidth: 44),
-                height: 40,
-                alignment: Alignment.center,
-                padding: const EdgeInsets.symmetric(horizontal: 10),
-                child: Text(label,
-                    style: TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.bold,
-                        color: primary ? cs.onPrimaryContainer : cs.onSurface)),
+      padding: const EdgeInsets.symmetric(horizontal: 2),
+      child: Material(
+        color: primary ? cs.primaryContainer : cs.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(8),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(8),
+          onTap: onTap,
+          child: Container(
+            constraints: const BoxConstraints(minWidth: 44),
+            height: 40,
+            alignment: Alignment.center,
+            padding: const EdgeInsets.symmetric(horizontal: 10),
+            child: Text(
+              label,
+              style: TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+                color: primary ? cs.onPrimaryContainer : cs.onSurface,
               ),
             ),
           ),
-        );
+        ),
+      ),
+    );
 
     return Material(
       elevation: 8,
       color: cs.surface,
       child: SafeArea(
         top: false,
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          if (exercises.isNotEmpty)
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (exercises.isNotEmpty)
+              SizedBox(
+                height: 40,
+                child: ListView(
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                  children: [
+                    for (final e in exercises)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 2),
+                        child: ActionChip(
+                          label: Text(e),
+                          visualDensity: VisualDensity.compact,
+                          materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                          onPressed: () => onExercise(e),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
             SizedBox(
-              height: 40,
+              height: 48,
               child: ListView(
                 scrollDirection: Axis.horizontal,
                 padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
                 children: [
-                  for (final e in exercises)
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 2),
-                      child: ActionChip(
-                        label: Text(e),
-                        visualDensity: VisualDensity.compact,
-                        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                        onPressed: () => onExercise(e),
-                      ),
-                    ),
+                  if (onSave != null) key('保存', onSave!, primary: true),
+                  key('@', () => onInsert('@'), primary: true),
+                  key('同じセット', onRepeat, primary: true),
+                  key('前回の内容', onPrevious),
+                  key('✕', () => onInsert('✕')),
+                  key('x', () => onInsert('x')),
+                  key('空白', () => onInsert(' ')),
+                  key('改行', () => onInsert('\n')),
+                  key('閉じる', onDone),
                 ],
               ),
             ),
-          SizedBox(
-            height: 48,
-            child: ListView(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-              children: [
-                key('@', () => onInsert('@'), primary: true),
-                key('同じセット', onRepeat, primary: true),
-                key('前回の内容', onPrevious),
-                key('✕', () => onInsert('✕')),
-                key('x', () => onInsert('x')),
-                key('空白', () => onInsert(' ')),
-                key('改行', () => onInsert('\n')),
-                key('完了', onDone),
-              ],
-            ),
-          ),
-        ]),
+          ],
+        ),
       ),
     );
   }
@@ -790,48 +1040,49 @@ class _PastMenuPickerState extends State<_PastMenuPicker> {
       expand: false,
       initialChildSize: 0.75,
       maxChildSize: 0.95,
-      builder: (c, ctrl) => Column(children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            Text('コピーするメニューを選択', style: theme.textTheme.titleLarge),
-            const SizedBox(height: 8),
-            TextField(
-              decoration: const InputDecoration(
-                prefixIcon: Icon(Icons.search),
-                hintText: 'メニュー名や種目名で検索',
-              ),
-              onChanged: (v) => setState(() => _q = v.trim()),
-            ),
-          ]),
-        ),
-        Expanded(
-          child: all.isEmpty
-              ? Center(child: Text(_q.isEmpty ? 'コピーできる過去のメニューがありません。' : '該当するメニューがありません。'))
-              : ListView.separated(
-                  controller: ctrl,
-                  itemCount: all.length,
-                  separatorBuilder: (_, _) => const Divider(height: 1),
-                  itemBuilder: (c, i) {
-                    final r = all[i];
-                    final ex = AppStore.instance.parsedOf(r).exercises;
-                    return ListTile(
-                      onTap: () => Navigator.pop(context, r),
-                      title: Text(
-                          '${fmtDateJa(r.dateTime)}${r.title.isNotEmpty ? '　${r.title}' : ''}'),
-                      subtitle: Text(
-                        ex.isNotEmpty
-                            ? ex.map((e) => '${e.name} ${e.compactSets}').join('\n')
-                            : r.menu.trim(),
-                        maxLines: 6,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      trailing: const Icon(Icons.content_paste_go),
-                    );
-                  },
+      builder: (c, ctrl) => Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text('コピーするメニューを選択', style: theme.textTheme.titleLarge),
+                const SizedBox(height: 8),
+                TextField(
+                  decoration: const InputDecoration(prefixIcon: Icon(Icons.search), hintText: 'メニュー名や種目名で検索'),
+                  onChanged: (v) => setState(() => _q = v.trim()),
                 ),
-        ),
-      ]),
+              ],
+            ),
+          ),
+          Expanded(
+            child: all.isEmpty
+                ? Center(child: Text(_q.isEmpty ? 'コピーできる過去のメニューがありません。' : '該当するメニューがありません。'))
+                : ListView.separated(
+                    controller: ctrl,
+                    itemCount: all.length,
+                    separatorBuilder: (_, _) => const Divider(height: 1),
+                    itemBuilder: (c, i) {
+                      final r = all[i];
+                      final ex = AppStore.instance.parsedOf(r).exercises;
+                      return ListTile(
+                        onTap: () => Navigator.pop(context, r),
+                        title: Text('${fmtDateJa(r.dateTime)}${r.title.isNotEmpty ? '　${r.title}' : ''}'),
+                        subtitle: Text(
+                          ex.isNotEmpty
+                              ? ex.map((e) => '${e.name} ${e.compactSets}').join('\n')
+                              : r.menu.trim(),
+                          maxLines: 6,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        trailing: const Icon(Icons.content_paste_go),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
     );
   }
 }
