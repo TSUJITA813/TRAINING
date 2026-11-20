@@ -347,6 +347,16 @@ class _DayPageState extends State<_DayPage> {
     );
   }
 
+  Future<void> _copyMenuOnly() async {
+    final r = record;
+    if (r == null || r.menu.trim().isEmpty) {
+      showToast(context, 'コピーするメニューがありません');
+      return;
+    }
+    await Clipboard.setData(ClipboardData(text: buildMenuText(r)));
+    if (mounted) showToast(context, 'メニューをコピーしました');
+  }
+
   Future<void> _pickDate() async {
     final d = await showDatePicker(
       context: context,
@@ -559,11 +569,22 @@ class _DayPageState extends State<_DayPage> {
             Row(children: [
               const Icon(Icons.fitness_center, size: 20),
               const SizedBox(width: 6),
-              Text('トレーニングメニュー', style: theme.textTheme.titleMedium),
-              const Spacer(),
+              Expanded(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Text('トレーニングメニュー', style: theme.textTheme.titleMedium),
+                ),
+              ),
+              IconButton(
+                tooltip: 'メニューをコピー（整形済み）',
+                visualDensity: VisualDensity.compact,
+                onPressed: _copyMenuOnly,
+                icon: const Icon(Icons.content_copy, size: 20),
+              ),
               TextButton.icon(
                 onPressed: _copyFromPast,
-                icon: const Icon(Icons.copy_all, size: 18),
+                icon: const Icon(Icons.history, size: 18),
                 label: const Text('過去からコピー'),
               ),
             ]),

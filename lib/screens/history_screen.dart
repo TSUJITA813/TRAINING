@@ -1,7 +1,9 @@
+import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
 import '../models.dart';
 import '../parser.dart';
+import '../share_text.dart';
 import '../store.dart';
 import '../widgets.dart';
 
@@ -17,8 +19,72 @@ class _HistoryScreenState extends State<HistoryScreen> {
   String _q = '';
   bool _byExercise = false;
 
+  /// 複数選択中の日付（空なら通常モード）
+  final Set<String> _selected = {};
+  List<DayRecord> _visible = [];
+  bool get _selecting => _selected.isNotEmpty;
+
+  Future<void> _copyText(String text, String msg) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    if (mounted) showToast(context, msg);
+  }
+
+  void _copyOne(DayRecord r) =>
+      _copyText(buildMenuText(r), '${fmtDateShort(r.dateTime)}のメニューをコピーしました');
+
+  void _copySelected() {
+    final recs = AppStore.instance.records.values
+        .where((r) => _selected.contains(r.date) && r.menu.trim().isNotEmpty)
+        .toList();
+    if (recs.isEmpty) {
+      showToast(context, 'コピーできるメニューがありません');
+      return;
+    }
+    _copyText(buildMenusText(recs), '${recs.length}日分のメニューをコピーしました');
+    setState(_selected.clear);
+  }
+
+  void _toggle(DayRecord r) {
+    if (r.menu.trim().isEmpty) {
+      showToast(context, 'この日はトレーニングの記録がありません');
+      return;
+    }
+    setState(() => _selected.contains(r.date) ? _selected.remove(r.date) : _selected.add(r.date));
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (_selecting) {
+      final selectable = _visible.where((r) => r.menu.trim().isNotEmpty).map((r) => r.date).toSet();
+      return PopScope(
+        canPop: false,
+        onPopInvokedWithResult: (_, _) => setState(_selected.clear),
+        child: Scaffold(
+          appBar: AppBar(
+            leading: IconButton(
+              tooltip: '選択をやめる',
+              icon: const Icon(Icons.close),
+              onPressed: () => setState(_selected.clear),
+            ),
+            title: Text('${_selected.length}日を選択中'),
+            actions: [
+              TextButton(
+                onPressed: () => setState(() => _selected.length == selectable.length
+                    ? _selected.clear()
+                    : _selected.addAll(selectable)),
+                child: Text(_selected.length == selectable.length ? '選択解除' : 'すべて選択'),
+              ),
+            ],
+          ),
+          floatingActionButton: FloatingActionButton.extended(
+            onPressed: _copySelected,
+            icon: const Icon(Icons.content_copy),
+            label: Text('${_selected.length}日分をコピー'),
+          ),
+          body: ListenableBuilder(listenable: AppStore.instance, builder: (context, _) => _dayList()),
+        ),
+      );
+    }
     return Scaffold(
       appBar: AppBar(
         title: const Text('履歴'),
@@ -66,6 +132,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
             r.menu.toLowerCase().contains(q) ||
             r.condition.toLowerCase().contains(q))
         .toList();
+    _visible = list;
     if (list.isEmpty) {
       return Center(child: Text(q.isEmpty ? 'まだ記録がありません。' : '該当する記録がありません。'));
     }
@@ -81,15 +148,25 @@ class _HistoryScreenState extends State<HistoryScreen> {
           if (r.steps != null) '${fmtKg(r.steps!.toDouble())}歩',
           if (w.totalVolume > 0) '総挙上量 ${fmtKg(w.totalVolume)}kg',
         ];
+        final selected = _selected.contains(r.date);
         return Card(
+          color: selected ? theme.colorScheme.primaryContainer : null,
           child: InkWell(
             borderRadius: BorderRadius.circular(12),
-            onTap: () => widget.onOpenDay(r.dateTime),
-            onLongPress: () => _recordMenu(r),
+            onTap: () => _selecting ? _toggle(r) : widget.onOpenDay(r.dateTime),
+            onLongPress: () => _toggle(r),
             child: Padding(
               padding: const EdgeInsets.all(12),
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 Row(children: [
+                  if (_selecting)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 6),
+                      child: Icon(
+                        selected ? Icons.check_circle : Icons.radio_button_unchecked,
+                        color: selected ? theme.colorScheme.primary : theme.colorScheme.outline,
+                      ),
+                    ),
                   Text(fmtDateJa(r.dateTime), style: theme.textTheme.titleSmall),
                   const SizedBox(width: 8),
                   if (r.title.isNotEmpty)
@@ -101,21 +178,29 @@ class _HistoryScreenState extends State<HistoryScreen> {
                     )
                   else
                     const Spacer(),
-                  IconButton(
-                    visualDensity: VisualDensity.compact,
-                    tooltip: 'その他の操作',
-                    icon: const Icon(Icons.more_vert),
-                    onPressed: () => _recordMenu(r),
-                  ),
+                  if (!_selecting) ...[
+                    if (r.menu.trim().isNotEmpty)
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        tooltip: 'メニューをコピー',
+                        icon: const Icon(Icons.content_copy, size: 20),
+                        onPressed: () => _copyOne(r),
+                      ),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: 'その他の操作',
+                      icon: const Icon(Icons.more_vert),
+                      onPressed: () => _recordMenu(r),
+                    ),
+                  ],
                 ]),
                 if (info.isNotEmpty) Text(info.join('／'), style: theme.textTheme.bodySmall),
                 if (w.exercises.isNotEmpty) ...[
                   const SizedBox(height: 6),
-                  for (final e in w.exercises.take(8))
-                    Text('${e.name}  ${e.compactSets}',
-                        maxLines: 1, overflow: TextOverflow.ellipsis, style: theme.textTheme.bodyMedium),
-                  if (w.exercises.length > 8)
-                    Text('ほか${w.exercises.length - 8}種目', style: theme.textTheme.bodySmall),
+                  for (final line in exerciseLines(w).take(8))
+                    Text(line, style: theme.textTheme.bodyMedium),
+                  if (exerciseLines(w).length > 8)
+                    Text('ほか${exerciseLines(w).length - 8}行', style: theme.textTheme.bodySmall),
                 ],
                 if (r.condition.trim().isNotEmpty) ...[
                   const SizedBox(height: 6),
@@ -145,6 +230,19 @@ class _HistoryScreenState extends State<HistoryScreen> {
           ),
           if (r.menu.trim().isNotEmpty)
             ListTile(
+              leading: const Icon(Icons.content_copy),
+              title: const Text('メニューをクリップボードにコピー'),
+              subtitle: const Text('【メニュー名】日付と整形したトレーニング内容のみ'),
+              onTap: () => Navigator.pop(c, 'clip'),
+            ),
+          if (r.menu.trim().isNotEmpty)
+            ListTile(
+              leading: const Icon(Icons.checklist),
+              title: const Text('複数の日を選んでコピー'),
+              onTap: () => Navigator.pop(c, 'select'),
+            ),
+          if (r.menu.trim().isNotEmpty)
+            ListTile(
               leading: const Icon(Icons.content_paste_go),
               title: const Text('このメニューを今日にコピー'),
               onTap: () => Navigator.pop(c, 'copy'),
@@ -162,6 +260,10 @@ class _HistoryScreenState extends State<HistoryScreen> {
     switch (action) {
       case 'open':
         widget.onOpenDay(r.dateTime);
+      case 'clip':
+        _copyOne(r);
+      case 'select':
+        _toggle(r);
       case 'copy':
         final t = store.ensureRecord(today());
         if (t.menu.trim().isNotEmpty) {
